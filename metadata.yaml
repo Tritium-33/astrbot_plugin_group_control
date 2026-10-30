@@ -1,0 +1,7 @@
+name: astrbot_plugin_group_control
+display_name: 群聊控制
+desc: 独立 QQ 群发言面板，一键与批量开关，统一拦截回复和主动发送
+version: v0.1.0
+author: Tritium-33
+repo: https://github.com/Tritium-33/astrbot_plugin_group_control
+astrbot_version: '==4.29.3'
