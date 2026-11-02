@@ -11,6 +11,8 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
 
 from .group_gate import GroupGate
 from .group_panel import GroupPanel
+from .image_adapter import ImageAdapter
+from .image_policy import TURN, ImagePolicy
 
 PLUGIN = "astrbot_plugin_group_control"
 
@@ -20,6 +22,8 @@ class GroupControlPlugin(Star):
         super().__init__(context)
         folder = StarTools.get_data_dir(PLUGIN)
         self.group_gate = GroupGate(self, folder / "group_switches.json")
+        self.image_policy = ImagePolicy(self.group_gate, folder / "image_usage.json")
+        self.image_adapter = ImageAdapter(self, self.image_policy)
         self.group_panel = GroupPanel(self)
 
     def legacy_conflict(self):
@@ -41,7 +45,14 @@ class GroupControlPlugin(Star):
             / "group_switches.json"
         )
         migrated = self.group_gate.load(legacy)
+        self.image_policy.load()
         try:
+            from astrbot.core.agent.runners.tool_loop_agent_runner import (
+                ToolLoopAgentRunner,
+            )
+
+            self.image_adapter.install_runner(ToolLoopAgentRunner)
+            self.image_adapter.attach()
             self.group_gate.install(
                 PipelineScheduler, UnifiedApi, AiocqhttpMessageEvent
             )
@@ -59,7 +70,25 @@ class GroupControlPlugin(Star):
     @filter.on_astrbot_loaded()
     async def loaded(self):
         self.group_gate.attach_gcp()
+        self.image_adapter.attach()
+
+    @filter.on_llm_response(priority=-10000)
+    async def image_response(self, event, response):
+        if response and self.image_adapter.quiet_turn(event):
+            turn = event.get_extra(TURN)
+            if response.role == "err" and not turn.get("error_sent"):
+                await self.image_adapter.send_error(event, response.completion_text)
+            response.completion_text = ""
+            response.reasoning_content = ""
+            response.result_chain = None
+
+    @filter.on_decorating_result(priority=10000)
+    async def image_result(self, event):
+        result = event.get_result()
+        if result and self.image_adapter.filter_chain(event, result) is None:
+            event.clear_result()
 
     async def terminate(self):
         self.group_panel.close()
+        self.image_adapter.close()
         self.group_gate.close()

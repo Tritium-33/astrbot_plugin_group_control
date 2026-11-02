@@ -1,6 +1,7 @@
 const bridge = window.AstrBotPluginView;
 const $ = (id) => document.getElementById(id);
 const selected = new Set();
+const drafts = new Map();
 let data = { groups: [], platforms: [], warnings: [] };
 let busy = false;
 const key = (row) => JSON.stringify([row.platform_id, row.group_id]);
@@ -60,12 +61,61 @@ function render() {
     toggle.disabled = busy || data.legacy_conflict || !row.available;
     toggle.append(element("span", "", row.enabled ? "允许发言" : "已关闭"), element("span", "track"));
     toggle.onclick = () => switchGroups([row], !row.enabled);
-    item.append(check, identity, toggle);
+    const heading = element("div", "group-heading");
+    heading.append(check, identity, toggle);
+    item.append(heading, imageControls(row));
     container.append(item);
   }
   $("refresh").disabled = busy;
   $("add-button").disabled = busy || data.legacy_conflict || !data.platforms.length;
   batchState();
+}
+
+function imageControls(row) {
+  const box = element("div", "image-controls");
+  const settings = drafts.get(key(row)) || { ...row.images };
+  const disabled = busy || !row.available || data.legacy_conflict;
+  const save = () => run(async () => {
+    const result = await bridge.apiPost("groups/images", {
+      platform_id: row.platform_id, group_id: row.group_id, images: settings,
+    });
+    drafts.delete(key(row));
+    return result;
+  }, `群 ${row.group_id} 生图设置已保存。`);
+  for (const [field, label] of [["enabled", "允许生图"], ["caption", "生图配文"]]) {
+    const button = element("button", "switch", label);
+    button.type = "button";
+    button.setAttribute("role", "switch");
+    button.setAttribute("aria-label", `群 ${row.group_id} ${label}`);
+    button.setAttribute("aria-checked", String(Boolean(settings[field])));
+    button.disabled = disabled;
+    button.append(element("span", "track"));
+    button.onclick = () => { settings[field] = !settings[field]; drafts.set(key(row), settings); save(); };
+    box.append(button);
+  }
+  const quotas = element("form", "quotas");
+  for (const [field, title, min, max] of [
+    ["per_request", "单次上限", 0, 100],
+    ["window_minutes", "周期（分钟）", 1, 43200],
+    ["window_limit", "周期上限", 0, 100000],
+  ]) {
+    const label = element("label", "", title);
+    const input = document.createElement("input");
+    input.type = "number";
+    input.min = min; input.max = max; input.step = "1"; input.required = true;
+    input.value = settings[field] ?? (field === "window_minutes" ? 60 : 0);
+    input.disabled = disabled;
+    input.setAttribute("aria-label", `群 ${row.group_id} ${title}`);
+    input.oninput = () => { settings[field] = input.value === "" ? null : Number(input.value); drafts.set(key(row), settings); };
+    label.append(input); quotas.append(label);
+  }
+  const button = element("button", "secondary", "保存限额");
+  button.type = "submit"; button.disabled = disabled;
+  quotas.append(button);
+  quotas.onsubmit = (event) => { event.preventDefault(); save(); };
+  box.append(quotas, element("div", "image-hint", `当前周期已用 ${row.image_used || 0} 张（含进行中）。上限 0 表示不限；关闭配文只发图片，不影响识图问答。`));
+  if (!data.image_ready) box.append(element("div", "flags", "生图插件尚未接入，设置会保存；需启用兼容的生图插件。"));
+  return box;
 }
 
 function accept(snapshot) {

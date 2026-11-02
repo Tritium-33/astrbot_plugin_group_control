@@ -26,6 +26,7 @@ class GroupPanel:
             ("groups", self.list_groups, "GET"),
             ("groups/refresh", self.refresh_groups, "POST"),
             ("groups/switch", self.switch_groups, "POST"),
+            ("groups/images", self.save_images, "POST"),
         ):
             route = f"/{PLUGIN}/{endpoint}"
             self.plugin.context.register_web_api(route, handler, [method], "群聊控制")
@@ -93,6 +94,14 @@ class GroupPanel:
                     **row,
                     "enabled": self.gate.state(key)["enabled"],
                     "available": row["platform_id"] in available,
+                    **(
+                        {
+                            "images": self.plugin.image_policy.settings(key),
+                            "image_used": self.plugin.image_policy.used(key),
+                        }
+                        if hasattr(self.plugin, "image_policy")
+                        else {}
+                    ),
                     "native_enabled": await SessionServiceManager.is_session_enabled(
                         umo
                     ),
@@ -107,7 +116,30 @@ class GroupPanel:
             "platforms": platforms,
             "warnings": warnings,
             "legacy_conflict": conflict,
+            "image_ready": bool(
+                getattr(getattr(self.plugin, "image_adapter", None), "instances", None)
+            ),
         }
+
+    async def save_images(self):
+        payload = await request.json(default={})
+        if (
+            not isinstance(payload, dict)
+            or payload.get("platform_id")
+            not in {p.meta().id for p in self.gate.platforms()}
+            or not isinstance(payload.get("group_id"), str)
+            or not re.fullmatch(r"[1-9][0-9]{4,15}", payload["group_id"])
+        ):
+            return error_response("请选择有效平台和群号")
+        key = self.gate.key(payload["platform_id"], payload["group_id"])
+        try:
+            self.plugin.image_policy.update(key, payload.get("images"))
+        except ValueError as error:
+            return error_response(str(error))
+        except OSError:
+            logger.exception("[群聊控制] 保存生图设置失败")
+            return error_response("保存失败，原设置未改变", status_code=500)
+        return json_response(await self.snapshot())
 
     async def list_groups(self):
         if not self.refreshed:

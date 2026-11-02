@@ -65,6 +65,7 @@ class GroupGate:
             key = self.key(row["platform_id"], row["group_id"])
             previous = self.state(key)
             states[key] = {
+                **previous,
                 "enabled": enabled,
                 "epoch": previous["epoch"] + int(previous["enabled"] and not enabled),
                 "name": row.get("name", previous.get("name", "")),
@@ -172,6 +173,9 @@ class GroupGate:
         async def execute(instance, event):
             if self.active:
                 self.attach_gcp()
+                images = getattr(self.plugin, "image_adapter", None)
+                if images:
+                    images.attach()
                 if self.blocked(event):
                     event.stop_event()
                     return
@@ -181,6 +185,11 @@ class GroupGate:
         async def call_action(api, action, **params):
             if self.active and self.outbound_blocked(api, action, params):
                 raise GroupMuted()
+            images = getattr(self.plugin, "image_adapter", None)
+            if self.active and images:
+                params = images.filter_outbound(api, action, params)
+                if params is None:
+                    return {"message_id": 0}
             return await original_action(api, action, **params)
 
         self.active = True
@@ -201,6 +210,11 @@ class GroupGate:
                     event.stop_event()
                     # An interrupted send must not count as a successful quota use.
                     raise GroupMuted()
+                images = getattr(self.plugin, "image_adapter", None)
+                if self.active and images:
+                    message = images.filter_chain(event, message)
+                    if message is None:
+                        return
                 return await original_send(event, message)
 
             self.patches.append((event_class, "send", original_send, send))
