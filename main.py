@@ -72,6 +72,13 @@ class GroupControlPlugin(Star):
         self.group_gate.attach_gcp()
         self.image_adapter.attach()
 
+    @filter.on_llm_request(priority=100)
+    async def image_request(self, event, request):
+        self.image_adapter.observe(event)
+        request.system_prompt = (
+            request.system_prompt or ""
+        ) + self.image_adapter.references.hint(event)
+
     @filter.on_llm_response(priority=-10000)
     async def image_response(self, event, response):
         if response and self.image_adapter.quiet_turn(event):

@@ -1,7 +1,7 @@
 name: astrbot_plugin_group_control
 display_name: 群聊控制
 desc: QQ 群发言、生图与配文开关，单次及滚动周期图片限额
-version: v0.2.0
+version: v0.3.0
 author: Tritium-33
 repo: https://github.com/Tritium-33/astrbot_plugin_group_control
 astrbot_version: '==4.29.3'

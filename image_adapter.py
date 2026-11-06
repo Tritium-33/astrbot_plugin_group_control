@@ -8,6 +8,7 @@ import asyncio
 import copy
 import importlib
 from contextvars import ContextVar
+from dataclasses import replace
 from functools import wraps
 
 from astrbot.api import logger
@@ -15,9 +16,11 @@ from astrbot.core.provider.entities import LLMResponse
 from mcp.types import CallToolResult, TextContent
 
 from .image_policy import TURN
+from .image_references import CONTEXT, NO_REFERENCE, ImageReferences, ReferenceError
 
 TOOL = "gemini_image_generation"
 current_generation = ContextVar("group_control.generation", default=None)
+reference_prompt = ContextVar("group_control.reference_prompt", default=None)
 error_delivery = ContextVar("group_control.image_error", default=False)
 
 
@@ -27,6 +30,26 @@ class ImageAdapter:
         self.patches = []
         self.instances = set()
         self.active = True
+        self.references = ImageReferences(
+            policy.gate, policy.path.parent / "image_references"
+        )
+
+    def capability(self, event):
+        key = self.policy.gate.event_key(event)
+        return {
+            "group_allows_generation": (
+                self.policy.settings(key)["enabled"]
+                and self.policy.gate.state(key)["enabled"]
+            )
+            if key
+            else True,
+            "reference_binding": bool(self.instances),
+            "previous_image_available": self.references.key(event)
+            in self.references.recent,
+        }
+
+    def observe(self, event):
+        self.references.observe(event)
 
     def patch(self, owner, name, replacement):
         self.patches.append((owner, name, getattr(owner, name), replacement))
@@ -203,19 +226,59 @@ class ImageAdapter:
 
     def attach_plugin(self, plugin, module):
         original_core = plugin.image_generator.generate_image_core
+        original_fetch = plugin._fetch_images_from_event
+
+        @wraps(original_fetch)
+        async def fetch(event, *args, **kwargs):
+            state = event.get_extra(CONTEXT) or {}
+            if self.active and state.get("bound"):
+                return list(state["bound"]["images"]), []
+            return await original_fetch(event, *args, **kwargs)
+
+        self.patch(plugin, "_fetch_images_from_event", fetch)
 
         @wraps(original_core)
         async def core(event, *args, **kwargs):
             if not self.active or self.policy.gate.event_key(event) is None:
                 return await original_core(event, *args, **kwargs)
             turn = self.policy.turn(event)
+            try:
+                bound = await self.references.resolve(event, plugin)
+            except (ReferenceError, OSError, ValueError) as error:
+                turn["error"] = str(error)
+                return False, turn["error"]
+            if bound:
+                # Core entry is also used by explicit /改图 commands.
+                args = list(args)
+                supplied = args[0] if args else kwargs.get("prompt")
+                prompt = (
+                    supplied
+                    if supplied in bound.get("prompts", [])
+                    else bound["prompt"]
+                )
+                for index, name, value in (
+                    (0, "prompt", prompt),
+                    (1, "reference_images", bound["images"]),
+                    (2, "avatar_reference", []),
+                    (8, "negative_prompt", None),
+                ):
+                    if len(args) > index:
+                        args[index] = value
+                    else:
+                        kwargs[name] = value
             count = kwargs.get("image_count", args[11] if len(args) > 11 else 1)
             ticket, error = self.policy.reserve(event, count)
             if error:
                 turn["error"] = error
                 return False, error
             try:
-                success, result = await original_core(event, *args, **kwargs)
+                token = current_generation.set((plugin, event))
+                prompt_token = reference_prompt.set(prompt if bound else None)
+                try:
+                    success, result = await original_core(event, *args, **kwargs)
+                finally:
+                    reference_prompt.reset(prompt_token)
+                    current_generation.reset(token)
             except asyncio.CancelledError:
                 self.policy.settle(event, ticket, count)
                 raise
@@ -265,6 +328,49 @@ class ImageAdapter:
                 return error
             token = current_generation.set((tool.plugin, event))
             try:
+                explicit_none = NO_REFERENCE.search(
+                    self.references.observe(event)["text"]
+                )
+                requested = bool(kwargs.get("use_reference_images")) or any(
+                    item.get("use_reference_images")
+                    for item in (batch or [])
+                    if isinstance(item, dict)
+                )
+                bound = await self.references.resolve(
+                    event, tool.plugin, requested=requested
+                )
+                if bound or explicit_none:
+
+                    def bind(item, index=0):
+                        selected = {
+                            **item,
+                            "use_reference_images": bool(bound),
+                            "reference_image_paths": [],
+                            "include_user_avatar": False,
+                        }
+                        if bound:
+                            selected["prompt"] = bound["prompt"]
+                            if batch and len(batch) > 1:
+                                selected["prompt"] += (
+                                    f"\n本请求对应用户所需的第 {index + 1}/{len(batch)} 项图片，按原话中相应的要求处理。"
+                                )
+                            bound.setdefault("prompts", []).append(selected["prompt"])
+                            selected["negative_prompt"] = None
+                        return selected
+
+                    if batch:
+                        kwargs["batch_tasks"] = [
+                            bind(item, i) for i, item in enumerate(batch)
+                        ]
+                    else:
+                        kwargs = bind(kwargs)
+                if bound:
+                    logger.info(
+                        "[群聊控制] 参考图绑定 source=%s count=%d sha256=%s",
+                        bound["origin"],
+                        len(bound["images"]),
+                        ",".join(h[:12] for h in bound["hashes"]),
+                    )
                 result = await original_call(tool, context, **kwargs)
                 if (
                     isinstance(result, str)
@@ -295,7 +401,12 @@ class ImageAdapter:
             generation = current_generation.get()
             image_plugin, event = generation if generation else (None, None)
             if not self.quiet_turn(event):
-                return await original_result(*args, **kwargs)
+                result = await original_result(*args, **kwargs)
+                if event is not None and self.active:
+                    self.references.generated(
+                        event, kwargs.get("image_urls"), kwargs.get("image_paths")
+                    )
+                return result
             # v3.2 calls this with keyword arguments.
             await self.deliver(image_plugin, module, event, kwargs)
             return CallToolResult(
@@ -310,7 +421,13 @@ class ImageAdapter:
         @wraps(original_notify)
         async def notify(image_plugin, event, payload, **kwargs):
             if not self.quiet_turn(event):
-                return await original_notify(image_plugin, event, payload, **kwargs)
+                result = await original_notify(image_plugin, event, payload, **kwargs)
+                if self.active:
+                    for item in payload.get("items", [payload]):
+                        self.references.generated(
+                            event, item.get("image_urls"), item.get("image_paths")
+                        )
+                return result
             for item in payload.get("items", [payload]):
                 if item.get("image_urls") or item.get("image_paths"):
                     await self.deliver(image_plugin, module, event, item)
@@ -336,6 +453,52 @@ class ImageAdapter:
         ):
             self.patch(target, "notify_llm_background_result", notify)
         self.instances.add(id(plugin))
+        self.attach_provider(importlib.import_module(base + ".api.openai_images"))
+
+    def attach_provider(self, module):
+        owner = module.OpenAIImagesProvider
+        if any(target is owner for target, *_ in self.patches):
+            return
+        original = owner.build_request
+
+        @wraps(original)
+        async def build(instance, *, client, config):
+            generation = current_generation.get()
+            event = generation[1] if generation else None
+            state = event.get_extra(CONTEXT) if event else None
+            bound = state.get("bound") if state else None
+            if not self.active or not bound:
+                return await original(instance, client=client, config=config)
+            settings = (
+                config.provider_settings
+                or getattr(client, "openai_images_settings", {})
+                or {}
+            )
+            if settings.get("generations_only"):
+                raise module.APIError(
+                    "[参考图未提交] 供应商开启了仅文生图，请关闭该选项。",
+                    retryable=False,
+                )
+            if len(bound["images"]) > min(
+                max(int(settings.get("max_reference_images", 6)), 1), 16
+            ):
+                raise module.APIError(
+                    "[参考图过多] 供应商上限不足以携带本次全部原图。", retryable=False
+                )
+            config = replace(
+                config,
+                reference_images=list(bound["images"]),
+                prompt=reference_prompt.get() or bound["prompt"],
+                negative_prompt=None,
+            )
+            request = await original(instance, client=client, config=config)
+            logger.info(
+                "[群聊控制] 原图请求已构建 endpoint=images/edits count=%d",
+                len(bound["images"]),
+            )
+            return request
+
+        self.patch(owner, "build_request", build)
 
     async def deliver(self, plugin, module, event, payload):
         sent = await module._dispatch_generation_result(
@@ -349,6 +512,9 @@ class ImageAdapter:
         if not sent:
             raise RuntimeError("图片已生成，但发送失败")
         self.policy.turn(event)["delivered"] = True
+        self.references.generated(
+            event, payload.get("image_urls"), payload.get("image_paths")
+        )
 
     def close(self):
         self.active = False

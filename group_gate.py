@@ -179,6 +179,8 @@ class GroupGate:
                 if self.blocked(event):
                     event.stop_event()
                     return
+                if images:
+                    images.observe(event)
             return await original_execute(instance, event)
 
         @wraps(original_action)
