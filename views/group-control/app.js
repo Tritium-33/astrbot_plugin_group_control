@@ -2,6 +2,8 @@ const bridge = window.AstrBotPluginView;
 const $ = (id) => document.getElementById(id);
 const selected = new Set();
 const drafts = new Map();
+const replyDrafts = new Map();
+const expandedImages = new Set();
 let data = { groups: [], platforms: [], warnings: [] };
 let busy = false;
 const key = (row) => JSON.stringify([row.platform_id, row.group_id]);
@@ -63,12 +65,93 @@ function render() {
     toggle.onclick = () => switchGroups([row], !row.enabled);
     const heading = element("div", "group-heading");
     heading.append(check, identity, toggle);
-    item.append(heading, imageControls(row));
+    const images = element("details", "image-section");
+    images.open = expandedImages.has(key(row));
+    images.ontoggle = () => { images.open ? expandedImages.add(key(row)) : expandedImages.delete(key(row)); };
+    images.append(element("summary", "", "生图与配文"), imageControls(row));
+    item.append(heading, replyControls(row), images);
     container.append(item);
   }
   $("refresh").disabled = busy;
+  $("refresh-usage").disabled = busy;
   $("add-button").disabled = busy || data.legacy_conflict || !data.platforms.length;
   batchState();
+}
+
+function replyControls(row) {
+  const box = element("section", "reply-controls");
+  box.setAttribute("aria-label", `群 ${row.group_id} 回复额度`);
+  const defaults = { total: {enabled: false, seconds: 3600, limit: 10}, ambient: {enabled: false, seconds: 3600, limit: 1}, gcp_unlimited: false };
+  const settings = replyDrafts.get(key(row)) || structuredClone(row.replies || defaults);
+  const disabled = busy || !row.available || data.legacy_conflict;
+  const form = element("form", "reply-form");
+  const grid = element("div", "reply-grid");
+  for (const [kind, title, help] of [
+    ["total", "总回复额度", "直接 @、关键词和主动接话共同计数"],
+    ["ambient", "读空气回复额度", "未直接 @的接话计数；直接 @不占用"],
+  ]) {
+    const rule = settings[kind];
+    const usage = row.reply_used?.[kind] || { used: 0, pending: 0, wait_seconds: 0 };
+    const card = element("div", `quota-card ${rule.enabled ? "is-enabled" : ""}`);
+    const top = element("div", "quota-heading");
+    top.append(element("h2", "", title));
+    const toggle = element("button", "switch", rule.enabled ? "已启用" : "不限");
+    toggle.type = "button";
+    toggle.setAttribute("role", "switch");
+    toggle.setAttribute("aria-label", `群 ${row.group_id} ${title}`);
+    toggle.setAttribute("aria-checked", String(rule.enabled));
+    toggle.disabled = disabled;
+    toggle.append(element("span", "track"));
+    toggle.onclick = () => { rule.enabled = !rule.enabled; replyDrafts.set(key(row), settings); render(); };
+    top.append(toggle);
+    card.append(top, element("p", "quota-help", help));
+    const meter = element("div", "quota-meter");
+    meter.append(element("strong", "", String(usage.used)), element("span", "", rule.enabled ? ` / ${rule.limit} 轮` : " 轮 · 无上限"));
+    card.append(meter, element("div", "quota-pending", `进行中 ${usage.pending} 轮`));
+    const inputs = element("div", "quota-inputs");
+    for (const [field, labelText, max] of [["seconds", "窗口（秒）", 2592000], ["limit", "最多（轮）", 100000]]) {
+      const label = element("label", "", labelText);
+      const input = document.createElement("input");
+      input.type = "number"; input.min = "1"; input.max = String(max); input.step = "1"; input.required = true;
+      input.value = rule[field] ?? "";
+      input.disabled = disabled;
+      input.setAttribute("aria-label", `群 ${row.group_id} ${title} ${labelText}`);
+      input.oninput = () => {
+        rule[field] = input.value === "" ? null : Number(input.value);
+        replyDrafts.set(key(row), settings);
+        status.textContent = "有未保存的回复额度设置";
+      };
+      label.append(input); inputs.append(label);
+    }
+    card.append(inputs);
+    if (rule.enabled && usage.used + usage.pending >= rule.limit) {
+      card.append(element("p", "quota-wait", usage.wait_seconds ? `约 ${usage.wait_seconds} 秒后释放下一轮额度` : "等待进行中的请求完成"));
+    }
+    grid.append(card);
+  }
+  const bottom = element("div", "reply-footer");
+  const gcp = element("label", "gcp-option");
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox"; checkbox.checked = settings.gcp_unlimited; checkbox.disabled = disabled;
+  checkbox.setAttribute("aria-label", `群 ${row.group_id} 跳过Chat Plus冷却`);
+  checkbox.onchange = () => { settings.gcp_unlimited = checkbox.checked; replyDrafts.set(key(row), settings); status.textContent = "有未保存的回复额度设置"; };
+  gcp.append(checkbox, document.createTextNode("跳过 Chat Plus 冷却"));
+  const save = element("button", "primary", "保存回复额度");
+  save.type = "submit"; save.disabled = disabled;
+  save.setAttribute("aria-label", `保存群 ${row.group_id} 回复额度`);
+  bottom.append(gcp, save);
+  const status = element("p", "draft-status", replyDrafts.has(key(row)) ? "有未保存的回复额度设置" : "修改开关或数值后，点击保存即可生效。");
+  form.append(grid, bottom, status);
+  form.onsubmit = (event) => {
+    event.preventDefault();
+    run(async () => {
+      const result = await bridge.apiPost("groups/replies", {platform_id: row.platform_id, group_id: row.group_id, replies: settings});
+      replyDrafts.delete(key(row));
+      return result;
+    }, `群 ${row.group_id} 回复额度已保存并生效。`);
+  };
+  box.append(form, element("p", "image-hint", "跳过 Chat Plus 冷却时仍保留概率与读空气判断；上方两项额度独立生效。"));
+  return box;
 }
 
 function imageControls(row) {
@@ -159,6 +242,7 @@ $("select-all").onchange = () => {
 $("enable-selected").onclick = () => switchGroups(data.groups.filter((r) => selected.has(key(r))), true);
 $("disable-selected").onclick = () => switchGroups(data.groups.filter((r) => selected.has(key(r))), false);
 $("refresh").onclick = () => run(() => bridge.apiPost("groups/refresh", {}), "群列表已刷新。");
+$("refresh-usage").onclick = () => run(() => bridge.apiGet("groups"), "回复用量已刷新。");
 $("add-group").onsubmit = (event) => {
   event.preventDefault();
   switchGroups([{ platform_id: $("platform").value, group_id: $("group-id").value.trim() }], false);

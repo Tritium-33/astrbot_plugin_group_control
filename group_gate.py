@@ -9,6 +9,8 @@ from functools import wraps
 from aiocqhttp.exceptions import ActionFailed
 from astrbot.api.platform import MessageType
 
+from .reply_policy import ReplyTurn, current_turn
+
 STAMP = "group_control.epoch"
 DENIED = "group_control.denied"
 proactive_turn = ContextVar("group_control.proactive_turn", default=None)
@@ -19,6 +21,11 @@ class GroupMuted(ActionFailed):
         super().__init__(
             {"retcode": 1403, "message": "群发言总开关已关闭，本条消息未发送"}
         )
+
+
+class ReplyLimited(ActionFailed):
+    def __init__(self):
+        super().__init__({"retcode": 1429, "message": "本群回复额度已用完"})
 
 
 class GroupGate:
@@ -163,7 +170,7 @@ class GroupGate:
         previous = proactive_turn.get()
         return bool(previous and previous[0] == key and previous[1] != state["epoch"])
 
-    def install(self, scheduler, api_class, event_class=None):
+    def install(self, scheduler, api_class, event_class=None, process_stage=None):
         if self.active:
             return
         original_execute = scheduler.execute
@@ -171,17 +178,28 @@ class GroupGate:
 
         @wraps(original_execute)
         async def execute(instance, event):
-            if self.active:
-                self.attach_gcp()
-                images = getattr(self.plugin, "image_adapter", None)
-                if images:
-                    images.attach()
-                if self.blocked(event):
-                    event.stop_event()
-                    return
-                if images:
-                    images.observe(event)
-            return await original_execute(instance, event)
+            policy = getattr(self.plugin, "reply_policy", None) if self.active else None
+            turn = policy.observe(event) if policy else None
+            token = current_turn.set(turn)
+            try:
+                if self.active:
+                    self.attach_gcp()
+                    images = getattr(self.plugin, "image_adapter", None)
+                    if images:
+                        images.attach()
+                    if self.blocked(event):
+                        event.stop_event()
+                        return
+                    groups = getattr(self.plugin, "gcp_policy", None)
+                    if groups:
+                        groups.clear_cooldown(event)
+                    if images:
+                        images.observe(event)
+                return await original_execute(instance, event)
+            finally:
+                if policy:
+                    policy.release(turn)
+                current_turn.reset(token)
 
         @wraps(original_action)
         async def call_action(api, action, **params):
@@ -192,7 +210,22 @@ class GroupGate:
                 params = images.filter_outbound(api, action, params)
                 if params is None:
                     return {"message_id": 0}
-            return await original_action(api, action, **params)
+            policy = getattr(self.plugin, "reply_policy", None) if self.active else None
+            turn = policy.outbound(api, action, params) if policy else None
+            if policy and not policy.acquire(turn):
+                raise ReplyLimited()
+            try:
+                result = await original_action(api, action, **params)
+                if (
+                    policy
+                    and isinstance(result, dict)
+                    and result.get("message_id") not in (None, 0, "0")
+                ):
+                    policy.sent(turn)
+                return result
+            finally:
+                if policy:
+                    policy.release(turn)
 
         self.active = True
         for owner, name, replacement in (
@@ -201,6 +234,26 @@ class GroupGate:
         ):
             self.patches.append((owner, name, getattr(owner, name), replacement))
             setattr(owner, name, replacement)
+
+        if process_stage is not None:
+            original_process = process_stage.process
+
+            @wraps(original_process)
+            async def process(stage, event):
+                policy = (
+                    getattr(self.plugin, "reply_policy", None) if self.active else None
+                )
+                if policy and not policy.enter(event):
+                    return
+                try:
+                    async for value in original_process(stage, event):
+                        yield value
+                finally:
+                    if policy:
+                        policy.release(event.get_extra("group_control.reply_turn"))
+
+            self.patches.append((process_stage, "process", original_process, process))
+            process_stage.process = process
 
         if event_class is not None:
             original_send = event_class.send
@@ -217,7 +270,27 @@ class GroupGate:
                     message = images.filter_chain(event, message)
                     if message is None:
                         return
-                return await original_send(event, message)
+                policy = (
+                    getattr(self.plugin, "reply_policy", None) if self.active else None
+                )
+                turn = policy.observe(event) if policy else None
+                background = current_turn.get()
+                if (
+                    background
+                    and turn
+                    and background.key == turn.key
+                    and background.event is None
+                ):
+                    turn = background
+                if policy and not policy.acquire(turn):
+                    return
+                token = current_turn.set(turn)
+                try:
+                    return await original_send(event, message)
+                finally:
+                    if policy:
+                        policy.release(turn)
+                    current_turn.reset(token)
 
             self.patches.append((event_class, "send", original_send, send))
             event_class.send = send
@@ -227,6 +300,9 @@ class GroupGate:
         if not self.active:
             return
         for name, module in list(sys.modules.items()):
+            groups = getattr(self.plugin, "gcp_policy", None)
+            if groups and "group_chat_plus" in name:
+                groups.attach(module, name)
             if "group_chat_plus" not in name or not name.endswith(
                 ".utils.proactive_chat_manager"
             ):
@@ -265,7 +341,17 @@ class GroupGate:
                     with self.proactive(platform_id, chat_id) as allowed:
                         if not allowed:
                             return
-                        return await original(*args)
+                        policy = getattr(self.plugin, "reply_policy", None)
+                        turn = ReplyTurn(self.key(platform_id, chat_id), True)
+                        if policy and not policy.acquire(turn):
+                            return
+                        token = current_turn.set(turn)
+                        try:
+                            return await original(*args)
+                        finally:
+                            if policy:
+                                policy.release(turn)
+                            current_turn.reset(token)
 
                 return classmethod(process)
 

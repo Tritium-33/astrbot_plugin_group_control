@@ -9,11 +9,16 @@
 <body>
   <main>
     <header>
-      <div><p class="eyebrow">发言权限</p><h1>群聊控制</h1>
-        <p class="subtitle">点击开关即保存。开启后，继续遵守原有接话、权限和限流规则。</p></div>
-      <button id="refresh" class="secondary" disabled>刷新群列表</button>
+      <div><p class="eyebrow">QQ · 每群独立设置</p><h1>群聊控制</h1>
+        <p class="subtitle">统一管理发言权限、总回复额度、读空气回复额度和生图。</p></div>
+      <div class="header-actions"><button id="refresh-usage" class="secondary" disabled>刷新用量</button><button id="refresh" class="secondary" disabled>刷新群列表</button></div>
     </header>
     <div id="notice" role="status" aria-live="polite">正在连接 AstrBot…</div>
+    <section class="quota-guide" aria-label="额度说明">
+      <div><strong>总回复额度</strong><span>包括直接 @和主动接话。关闭即不限总次数。</span></div>
+      <div><strong>读空气回复额度</strong><span>限制未直接 @的主动接话。直接 @不计入此额度。</span></div>
+      <p>一次回答分多段发送，仍算 1 轮。次数按滑动窗口统计；主人管理指令豁免，群禁言仍优先。</p>
+    </section>
     <section class="board" aria-label="群聊开关">
       <div class="toolbar">
         <input id="search" type="search" placeholder="搜索群名、群号或平台" aria-label="搜索群聊">
@@ -27,7 +32,7 @@
       </div>
       <div id="groups" aria-live="polite"></div>
     </section>
-    <details>
+    <details id="add-group-details">
       <summary>添加群号</summary>
       <p class="muted">未出现在群列表中的群，也可以先登记开关。</p>
       <form id="add-group">
@@ -36,7 +41,7 @@
         <button type="submit" id="add-button" class="secondary" disabled>添加并关闭</button>
       </form>
     </details>
-    <p class="footnote">关闭后，主人、@、关键词和免冷却群均不例外。已交给 QQ 发送的消息不会撤回。</p>
+    <p class="footnote">发言总开关关闭后，主人、@、关键词均不例外。额度设置持久保存，回复计数在插件重载或 AstrBot 重启后重新统计。</p>
     <noscript>请启用 JavaScript，并在 AstrBot 的插件视图中打开此页面。</noscript>
   </main>
   <script type="module" src="./app.js"></script>

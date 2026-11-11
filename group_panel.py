@@ -27,6 +27,7 @@ class GroupPanel:
             ("groups/refresh", self.refresh_groups, "POST"),
             ("groups/switch", self.switch_groups, "POST"),
             ("groups/images", self.save_images, "POST"),
+            ("groups/replies", self.save_replies, "POST"),
         ):
             route = f"/{PLUGIN}/{endpoint}"
             self.plugin.context.register_web_api(route, handler, [method], "群聊控制")
@@ -102,6 +103,14 @@ class GroupPanel:
                         if hasattr(self.plugin, "image_policy")
                         else {}
                     ),
+                    **(
+                        {
+                            "replies": self.plugin.reply_policy.settings(key),
+                            "reply_used": self.plugin.reply_policy.usage(key),
+                        }
+                        if hasattr(self.plugin, "reply_policy")
+                        else {}
+                    ),
                     "native_enabled": await SessionServiceManager.is_session_enabled(
                         umo
                     ),
@@ -111,6 +120,15 @@ class GroupPanel:
         warnings = list(self.warnings)
         if conflict:
             warnings.append("旧版路由插件仍包含群控，请更新至 v0.5.8 并重载后再操作。")
+        if any(
+            star.name == "astrbot_plugin_evidence_qa"
+            and star.activated
+            and hasattr(star.star_cls, "group_limit")
+            for star in self.plugin.context.get_all_stars()
+        ):
+            warnings.append(
+                "路由插件仍在执行旧限额，请先更新并重载至 v0.5.12，再使用本面板额度。"
+            )
         return {
             "groups": output,
             "platforms": platforms,
@@ -138,6 +156,26 @@ class GroupPanel:
             return error_response(str(error))
         except OSError:
             logger.exception("[群聊控制] 保存生图设置失败")
+            return error_response("保存失败，原设置未改变", status_code=500)
+        return json_response(await self.snapshot())
+
+    async def save_replies(self):
+        payload = await request.json(default={})
+        if (
+            not isinstance(payload, dict)
+            or payload.get("platform_id")
+            not in {p.meta().id for p in self.gate.platforms()}
+            or not isinstance(payload.get("group_id"), str)
+            or not re.fullmatch(r"[1-9][0-9]{4,15}", payload["group_id"])
+        ):
+            return error_response("请选择有效平台和群号")
+        key = self.gate.key(payload["platform_id"], payload["group_id"])
+        try:
+            self.plugin.reply_policy.update(key, payload.get("replies"))
+        except ValueError as error:
+            return error_response(str(error))
+        except OSError:
+            logger.exception("[群聊控制] 保存回复额度失败")
             return error_response("保存失败，原设置未改变", status_code=500)
         return json_response(await self.snapshot())
 

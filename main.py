@@ -11,8 +11,10 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
 
 from .group_gate import GroupGate
 from .group_panel import GroupPanel
+from .group_policy import GroupPolicy
 from .image_adapter import ImageAdapter
 from .image_policy import TURN, ImagePolicy
+from .reply_policy import ReplyPolicy
 
 PLUGIN = "astrbot_plugin_group_control"
 
@@ -22,6 +24,8 @@ class GroupControlPlugin(Star):
         super().__init__(context)
         folder = StarTools.get_data_dir(PLUGIN)
         self.group_gate = GroupGate(self, folder / "group_switches.json")
+        self.reply_policy = ReplyPolicy(self)
+        self.gcp_policy = GroupPolicy(self)
         self.image_policy = ImagePolicy(self.group_gate, folder / "image_usage.json")
         self.image_adapter = ImageAdapter(self, self.image_policy)
         self.group_panel = GroupPanel(self)
@@ -45,16 +49,18 @@ class GroupControlPlugin(Star):
             / "group_switches.json"
         )
         migrated = self.group_gate.load(legacy)
+        self.reply_policy.migrate()
         self.image_policy.load()
         try:
             from astrbot.core.agent.runners.tool_loop_agent_runner import (
                 ToolLoopAgentRunner,
             )
+            from astrbot.core.pipeline.process_stage.stage import ProcessStage
 
             self.image_adapter.install_runner(ToolLoopAgentRunner)
             self.image_adapter.attach()
             self.group_gate.install(
-                PipelineScheduler, UnifiedApi, AiocqhttpMessageEvent
+                PipelineScheduler, UnifiedApi, AiocqhttpMessageEvent, ProcessStage
             )
             self.group_gate.attach_gcp()
             self.group_panel.register()
@@ -69,11 +75,14 @@ class GroupControlPlugin(Star):
 
     @filter.on_astrbot_loaded()
     async def loaded(self):
+        self.reply_policy.migrate()
         self.group_gate.attach_gcp()
         self.image_adapter.attach()
 
     @filter.on_llm_request(priority=100)
     async def image_request(self, event, request):
+        if not self.reply_policy.acquire(self.reply_policy.observe(event)):
+            return
         self.image_adapter.observe(event)
         request.system_prompt = (
             request.system_prompt or ""
@@ -99,3 +108,5 @@ class GroupControlPlugin(Star):
         self.group_panel.close()
         self.image_adapter.close()
         self.group_gate.close()
+        self.gcp_policy.close()
+        self.reply_policy.close()
