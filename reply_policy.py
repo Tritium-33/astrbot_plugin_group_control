@@ -1,4 +1,4 @@
-"""Per-group total and ambient reply budgets, shared by all sending paths."""
+"""Per-group ambient permission and reply budgets, shared by sending paths."""
 
 from collections import defaultdict, deque
 from contextvars import ContextVar
@@ -22,6 +22,7 @@ class ReplyTurn:
     reserved: bool = False
     sent: bool = False
     denied: bool = False
+    ambient_epoch: int = 0
 
 
 class ReplyPolicy:
@@ -31,6 +32,29 @@ class ReplyPolicy:
         self.clock = clock
         self.history = defaultdict(deque)
         self.pending = {}
+
+    def ambient_allowed(self, key):
+        return self.gate.state(key).get("ambient_allowed", True)
+
+    def set_ambient_allowed(self, key, allowed):
+        if type(allowed) is not bool:
+            raise ValueError("读空气接话开关必须为开或关")
+        old = self.gate.state(key)
+        state = {
+            **old,
+            "ambient_allowed": allowed,
+            "ambient_epoch": old.get("ambient_epoch", 0)
+            + int(self.ambient_allowed(key) and not allowed),
+        }
+        self.gate.save({**self.gate.states, key: state})
+
+    def new_turn(self, key, ambient=True, event=None):
+        return ReplyTurn(
+            key,
+            ambient,
+            event,
+            ambient_epoch=self.gate.state(key).get("ambient_epoch", 0),
+        )
 
     def settings(self, key):
         saved = self.gate.state(key).get("replies", {})
@@ -130,7 +154,7 @@ class ReplyPolicy:
                 isinstance(part, At) and str(part.qq) == str(event.get_self_id())
                 for part in event.get_messages()
             )
-            turn = ReplyTurn(key, not direct, event)
+            turn = self.new_turn(key, not direct, event)
             event.set_extra(TURN, turn)
         return turn
 
@@ -213,15 +237,19 @@ class ReplyPolicy:
             return True
         if turn.denied:
             return False
-        if turn.sent:
-            return True
-        if self.exhausted(turn):
+        ambient_blocked = turn.ambient and (
+            not self.ambient_allowed(turn.key)
+            or turn.ambient_epoch != self.gate.state(turn.key).get("ambient_epoch", 0)
+        )
+        if ambient_blocked or (not turn.sent and self.exhausted(turn)):
             turn.denied = True
             self.release(turn)
             if turn.event is not None:
                 turn.event.stop_event()
                 turn.event.clear_result()
             return False
+        if turn.sent:
+            return True
         if not turn.reserved and any(
             self.settings(turn.key)[name]["enabled"] for name in ("total", "ambient")
         ):
@@ -262,7 +290,7 @@ class ReplyPolicy:
         event = current_message_event.get()
         if event is not None and self.gate.event_key(event) == key:
             return self.observe(event)
-        return ReplyTurn(key, True)
+        return self.new_turn(key)
 
     def close(self):
         self.pending.clear()

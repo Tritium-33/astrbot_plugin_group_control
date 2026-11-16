@@ -28,6 +28,7 @@ class GroupPanel:
             ("groups/switch", self.switch_groups, "POST"),
             ("groups/images", self.save_images, "POST"),
             ("groups/replies", self.save_replies, "POST"),
+            ("groups/ambient", self.switch_ambient, "POST"),
         ):
             route = f"/{PLUGIN}/{endpoint}"
             self.plugin.context.register_web_api(route, handler, [method], "群聊控制")
@@ -107,6 +108,9 @@ class GroupPanel:
                         {
                             "replies": self.plugin.reply_policy.settings(key),
                             "reply_used": self.plugin.reply_policy.usage(key),
+                            "ambient_allowed": self.plugin.reply_policy.ambient_allowed(
+                                key
+                            ),
                         }
                         if hasattr(self.plugin, "reply_policy")
                         else {}
@@ -185,6 +189,26 @@ class GroupPanel:
         return json_response(
             await self.snapshot(), headers={"Cache-Control": "no-store"}
         )
+
+    async def switch_ambient(self):
+        payload = await request.json(default={})
+        if (
+            not isinstance(payload, dict)
+            or payload.get("platform_id")
+            not in {p.meta().id for p in self.gate.platforms()}
+            or not isinstance(payload.get("group_id"), str)
+            or not re.fullmatch(r"[1-9][0-9]{4,15}", payload["group_id"])
+        ):
+            return error_response("请选择有效平台和群号")
+        key = self.gate.key(payload["platform_id"], payload["group_id"])
+        try:
+            self.plugin.reply_policy.set_ambient_allowed(key, payload.get("allowed"))
+        except ValueError as error:
+            return error_response(str(error))
+        except OSError:
+            logger.exception("[群聊控制] 保存读空气接话开关失败")
+            return error_response("保存失败，原开关状态未改变", status_code=500)
+        return json_response(await self.snapshot())
 
     async def refresh_groups(self):
         await self.refresh()

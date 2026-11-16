@@ -25,7 +25,9 @@ class GroupMuted(ActionFailed):
 
 class ReplyLimited(ActionFailed):
     def __init__(self):
-        super().__init__({"retcode": 1429, "message": "本群回复额度已用完"})
+        super().__init__(
+            {"retcode": 1429, "message": "本群接话权限或回复额度不允许本次发送"}
+        )
 
 
 class GroupGate:
@@ -342,7 +344,8 @@ class GroupGate:
                         if not allowed:
                             return
                         policy = getattr(self.plugin, "reply_policy", None)
-                        turn = ReplyTurn(self.key(platform_id, chat_id), True)
+                        key = self.key(platform_id, chat_id)
+                        turn = policy.new_turn(key) if policy else ReplyTurn(key, True)
                         if policy and not policy.acquire(turn):
                             return
                         token = current_turn.set(turn)

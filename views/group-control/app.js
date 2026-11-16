@@ -84,18 +84,34 @@ function replyControls(row) {
   const defaults = { total: {enabled: false, seconds: 3600, limit: 10}, ambient: {enabled: false, seconds: 3600, limit: 1}, gcp_unlimited: false };
   const settings = replyDrafts.get(key(row)) || structuredClone(row.replies || defaults);
   const disabled = busy || !row.available || data.legacy_conflict;
+  const permission = element("div", "ambient-permission");
+  const allowed = row.ambient_allowed !== false;
+  const permissionText = element("div", "");
+  permissionText.append(element("strong", "", "允许读空气接话"), element("p", "quota-help", "关闭后停止普通接话、关键词智能接话及后台主动发言；保留直接 @和主人管理指令。"));
+  const permissionToggle = element("button", "switch", allowed ? "已开启" : "已关闭");
+  permissionToggle.type = "button";
+  permissionToggle.setAttribute("role", "switch");
+  permissionToggle.setAttribute("aria-label", `群 ${row.group_id} 允许读空气接话`);
+  permissionToggle.setAttribute("aria-checked", String(allowed));
+  permissionToggle.disabled = disabled;
+  permissionToggle.append(element("span", "track"));
+  permissionToggle.onclick = () => run(() => bridge.apiPost("groups/ambient", {
+    platform_id: row.platform_id, group_id: row.group_id, allowed: !allowed,
+  }), `群 ${row.group_id} 读空气接话已${allowed ? "关闭" : "开启"}，已保存并生效。`);
+  permission.append(permissionText, permissionToggle);
+  box.append(permission);
   const form = element("form", "reply-form");
   const grid = element("div", "reply-grid");
   for (const [kind, title, help] of [
     ["total", "总回复额度", "直接 @、关键词和主动接话共同计数"],
-    ["ambient", "读空气回复额度", "未直接 @的接话计数；直接 @不占用"],
+    ["ambient", "限制读空气次数", "仅控制次数；关闭此限制表示不限次数，不会关闭自动接话"],
   ]) {
     const rule = settings[kind];
     const usage = row.reply_used?.[kind] || { used: 0, pending: 0, wait_seconds: 0 };
     const card = element("div", `quota-card ${rule.enabled ? "is-enabled" : ""}`);
     const top = element("div", "quota-heading");
     top.append(element("h2", "", title));
-    const toggle = element("button", "switch", rule.enabled ? "已启用" : "不限");
+    const toggle = element("button", "switch", rule.enabled ? "限制次数" : "不限次数");
     toggle.type = "button";
     toggle.setAttribute("role", "switch");
     toggle.setAttribute("aria-label", `群 ${row.group_id} ${title}`);
